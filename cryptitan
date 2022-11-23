@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PHP_VERSION=${PHP_VERSION:-"8"}
+export COMPOSER_VERSION=${COMPOSER_VERSION:-"2"}
+export NODE_VERSION=${NODE_VERSION:-"16"}
+export NGINX_VERSION=${NGINX_VERSION:-"1"}
+export REDIS_VERSION=${REDIS_VERSION:-"6"}
+
+if [[ $EUID -eq 0 ]]; then
+	echo -e "You cannot start Server as root." >&2 && exit 1
+fi
+
+UNAMEOUT="$(uname -s)"
+
+# Verify operating system is supported...
+case "${UNAMEOUT}" in
+Linux*) MACHINE=linux ;;
+Darwin*) MACHINE=mac ;;
+*) MACHINE="UNKNOWN" ;;
+esac
+
+if [ "$MACHINE" == "UNKNOWN" ]; then
+	echo "Unsupported operating system [$(uname -s)]." >&2 && exit 1
+fi
+
+# Ensure Docker is running...
+if ! docker info >/dev/null 2>&1; then
+	echo -e "Docker is not running." >&2 && exit 1
+fi
+
+# Define environment variables...
+export NGINX_SERVER="php-fpm"
+export APP_SERVICE="application"
+export WEBSOCKET_ENABLE="false"
+export PROXY_NETWORK=${PROXY_NETWORK:-nginx-proxy}
+export CERTBOT_ROOT_VOLUME=${CERTBOT_ROOT_VOLUME:-certbot-root}
+export LETSENCRYPT_LIB_VOLUME=${LETSENCRYPT_LIB_VOLUME:-letsencrypt-lib}
+export LETSENCRYPT_LOG_VOLUME=${LETSENCRYPT_LOG_VOLUME:-letsencrypt-log}
+export LETSENCRYPT_VOLUME=${LETSENCRYPT_VOLUME:-letsencrypt}
+export STOP_TIMEOUT=${STOP_TIMEOUT:-360}
+export HOST_UID=${HOST_UID:-$(id -u)}
+export HOST_GID=${HOST_GID:-$(id -g)}
+export APP_USER=${HOST_UID}
+
+# Define reusable functions
+function server_not_running() {
+	echo -e "Server is not running." >&2 && exit 1
+}
+
+function check_server_status() {
+	if [ -z "$(docker compose ps -q)" ] || docker compose ps | grep -q 'Exit\|exited'; then
+		echo -e "Server is not running." >&2 && exit 1
+	fi
+}
+
+function create_external_network() {
+	if ! docker network inspect "$1" >/dev/null 2>&1; then
+		docker network create "$1"
+	fi
+}
+
+function create_external_volume() {
+	if ! docker volume inspect "$1" >/dev/null 2>&1; then
+		docker volume create "$1"
+	fi
+}
+
+function container_exec() {
+	if [ ! -t 0 ]; then
+		docker compose exec -T "$@"
+	else
+		docker compose exec "$@"
+	fi
+}
+
+# Create external networks if not exists
+create_external_network "$PROXY_NETWORK"
+
+# Create external volume if not exists
+create_external_volume "$CERTBOT_ROOT_VOLUME"
+create_external_volume "$LETSENCRYPT_LIB_VOLUME"
+create_external_volume "$LETSENCRYPT_LOG_VOLUME"
+create_external_volume "$LETSENCRYPT_VOLUME"
+
+# Create home directories
+mkdir -p "${HOME}/.composer"
+
+COMPOSER_CMD="docker run --rm \
+--volume ${COMPOSER_HOME:-$HOME/.composer}:/tmp \
+--volume $(pwd):/app \
+--user $(id -u):$(id -g) \
+composer:${COMPOSER_VERSION}"
+
+PHP_CMD="docker run --rm -it \
+--user $(id -u):$(id -g) \
+--volume $(pwd):/app \
+--workdir /app \
+php:${PHP_VERSION}-cli php"
+
+SSL_NGINX_CMD="docker run --rm \
+-v ${LETSENCRYPT_VOLUME}:/etc/letsencrypt \
+-v ${LETSENCRYPT_LIB_VOLUME}:/var/lib/letsencrypt \
+-v ${LETSENCRYPT_LOG_VOLUME}:/var/log/letsencrypt \
+-v ${CERTBOT_ROOT_VOLUME}:/var/www/certbot \
+nginx"
+
+CERTBOT_CMD="docker run --rm -it \
+-v ${LETSENCRYPT_VOLUME}:/etc/letsencrypt \
+-v ${LETSENCRYPT_LIB_VOLUME}:/var/lib/letsencrypt \
+-v ${LETSENCRYPT_LOG_VOLUME}:/var/log/letsencrypt \
+-v ${CERTBOT_ROOT_VOLUME}:/var/www/certbot \
+certbot/certbot"
+
+# Create dhparams file if not exists
+if ! eval "$SSL_NGINX_CMD" test -f "/etc/letsencrypt/ssl-dhparams.pem"; then
+	eval "$SSL_NGINX_CMD" openssl dhparam -out "/etc/letsencrypt/ssl-dhparams.pem" 2048
+fi
+
+# Run composer install
+if [ ! -d "./vendor" ]; then
+	eval "$COMPOSER_CMD" install
+fi
+
+if [ $# -gt 0 ]; then
+	if [ "$1" == "init-env" ]; then
+		if [ ! -f ./.env ]; then
+			cp ./.env.example ./.env
+
+			eval "$PHP_CMD" artisan key:generate --force
+
+			echo -e ".env initialized"
+		else
+			echo -e ".env file exists"
+		fi
+	else
+		# Source Laravel environment files
+		if [ -f ./.env ]; then
+			source .env
+		else
+			echo -e ".env file does not exist." >&2 && exit 1
+		fi
+
+		# Verify safe APP_ENV value
+		if [ "$APP_ENV" == "production" ] && [ "$APP_DEBUG" == "true" ]; then
+			echo "You need to set APP_DEBUG=false in production" >&2 && exit 1
+		fi
+
+		# Set compose file to use based on environment
+		if [ "$APP_ENV" == "local" ]; then
+			if [ -f ./docker-compose.dev.yml ]; then
+				export COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.dev.yml
+			fi
+		else
+			if [ -f ./docker-compose.prod.yml ]; then
+				export COMPOSE_FILE=docker-compose.yml:docker-compose.override.yml:docker-compose.prod.yml
+			fi
+		fi
+
+		# Extract domain from APP_URL
+		if [[ $APP_URL =~ ^(https?):\/\/([A-Za-z0-9-]{1,63}\.)+([A-Za-z]{2,10})$ ]]; then
+			APP_DOMAIN=$(echo "$APP_URL" | awk -F[/:] '{print $4}' | sed -r 's/^www\.//')
+		else
+			echo "The value of APP_URL is invalid." >&2 && exit 1
+		fi
+
+		export APP_DOMAIN
+
+		# Set nginx server variables
+		if [ "$NGINX_SERVER" == "octane" ]; then
+			export NGINX_DEFAULT_SERVER="/etc/nginx/includes/octane"
+			export WORK_OCTANE=true
+		else
+			export NGINX_DEFAULT_SERVER="/etc/nginx/includes/php-fpm"
+			export WORK_OCTANE=false
+		fi
+
+		if [ "$WEBSOCKET_ENABLE" == "true" ]; then
+			export WORK_WEBSOCKET=true
+		fi
+
+		# Setup SSL Nginx Directives
+		CERTIFICATE_DIR="/etc/letsencrypt/live/${APP_DOMAIN}"
+
+		if (eval "$SSL_NGINX_CMD" test -f "${CERTIFICATE_DIR}/fullchain.pem") && (eval "$SSL_NGINX_CMD" test -f "${CERTIFICATE_DIR}/privkey.pem"); then
+			export NGINX_DEFAULT_CONFIG="/etc/nginx/conf.d/default.ssl"
+			export NGINX_WEBSOCKET_CONFIG="/etc/nginx/conf.d/websocket.ssl"
+
+			export NGINX_HTTP_PORT="80"
+
+			if [ "$WEBSOCKET_ENABLE" == "true" ]; then
+				export NGINX_HTTPS_PORT="443,2096"
+			else
+				export NGINX_HTTPS_PORT="443"
+			fi
+		else
+			export NGINX_DEFAULT_CONFIG="/etc/nginx/conf.d/default"
+			export NGINX_WEBSOCKET_CONFIG="/etc/nginx/conf.d/websocket"
+
+			if [ "$WEBSOCKET_ENABLE" == "true" ]; then
+				export NGINX_HTTP_PORT="80,2095"
+			else
+				export NGINX_HTTP_PORT="80"
+			fi
+		fi
+
+		# Update images and reinstall composer
+		if [ "$1" == "update" ]; then
+			docker compose stop --timeout="$STOP_TIMEOUT"
+			docker compose pull
+			docker pull "php:${PHP_VERSION}-fpm"
+			docker pull "nginx:${NGINX_VERSION}"
+			docker pull "redis:${REDIS_VERSION}"
+			eval "$COMPOSER_CMD" install
+			docker compose build
+
+		# Force recreate containers
+		elif [ "$1" == "recreate" ]; then
+			docker compose up -d --force-recreate
+
+		# Set timeout to stop command
+		elif [ "$1" == "stop" ]; then
+			shift 1
+
+			docker compose stop --timeout="$STOP_TIMEOUT" "$@"
+
+		# Run ssl to secure container...
+		elif [ "$1" == "ssl" ]; then
+			shift 1
+
+			if [ -z "$CERTBOT_EMAIL" ]; then
+				echo -e "Set CERTBOT_EMAIL to proceed." >&2 && exit 1
+			fi
+
+			check_server_status
+
+			eval "$CERTBOT_CMD" certonly \
+				--webroot --webroot-path=/var/www/certbot \
+				--email "$CERTBOT_EMAIL" \
+				--agree-tos --no-eff-email --force-renewal \
+				-d "$APP_DOMAIN" -d "www.${APP_DOMAIN}"
+
+			docker compose stop --timeout="$STOP_TIMEOUT"
+
+			echo -e "SSL Certificate generated!"
+			echo -e "Restart server."
+
+		# Proxy PHP commands to the "php" binary on the application container...
+		elif [ "$1" == "php" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				php "$@"
+
+		# Proxy Composer commands to the "composer" binary on the application container...
+		elif [ "$1" == "composer" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				composer "$@"
+
+		# Proxy Artisan commands to the "artisan" binary on the application container...
+		elif [ "$1" == "artisan" ] || [ "$1" == "art" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				php artisan "$@"
+
+		# Proxy the "debug" command to the "php artisan" binary on the application container with xdebug enabled...
+		elif [ "$1" == "debug" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				-e XDEBUG_SESSION=1 \
+				"$APP_SERVICE" \
+				php artisan "$@"
+
+		# Proxy the "test" command to the "php artisan test" Artisan command...
+		elif [ "$1" == "test" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				php artisan test "$@"
+
+		# Initiate a Laravel Tinker session within the application container...
+		elif [ "$1" == "tinker" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				php artisan tinker
+
+		# Proxy Node commands to the "node" binary on the application container...
+		elif [ "$1" == "node" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				node "$@"
+
+		# Proxy NPM commands to the "npm" binary on the application container...
+		elif [ "$1" == "npm" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				npm "$@"
+
+		# Proxy NPX commands to the "npx" binary on the application container...
+		elif [ "$1" == "npx" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				npx "$@"
+
+		# Initiate a MySQL CLI terminal session within the "mysql" container...
+		elif [ "$1" == "mysql" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				mysql mysql \
+				--user="$DB_USERNAME" \
+				--password="$DB_PASSWORD" \
+				"$DB_DATABASE" "$@"
+
+		# Initiate a Bash shell within the application container...
+		elif [ "$1" == "shell" ] || [ "$1" == "bash" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				-u "$APP_USER" \
+				"$APP_SERVICE" \
+				bash "$@"
+
+		# Initiate a root user Bash shell within the application container...
+		elif [ "$1" == "root-shell" ] || [ "$1" == "root-bash" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				"$APP_SERVICE" \
+				bash "$@"
+
+		# Initiate a Redis CLI terminal session within the "redis" container...
+		elif [ "$1" == "redis" ]; then
+			shift 1
+
+			check_server_status
+
+			container_exec \
+				redis redis-cli
+
+		# Pass unknown commands to the "docker compose"...
+		else
+			docker compose "$@"
+		fi
+	fi
+else
+	docker compose ps
+fi
